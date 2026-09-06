@@ -28,12 +28,20 @@ git pull
 ## Usage
 
 ```bash
-play-split                  # clipboard URL (or YouTube iframe HTML)
-play-split <url> [title]
+play-split                  # prompt for a URL (terminal) or use clipboard (keybind)
+play-split '<url>' [title]
 play-split --help
 ```
 
 Or press **SUPER + SHIFT + M**.
+
+Quote YouTube playlist URLs — bash treats `&` as background:
+
+```bash
+play-split 'https://www.youtube.com/watch?v=ID&list=...'
+```
+
+Over SSH it still opens on **that machine's desktop** (the Hyprland session you are logged into there), not in the SSH terminal. Run `play-split` and paste the URL at the prompt, or pass it quoted.
 
 In mpv: **c** or the corner **CC** button toggles subtitles.
 

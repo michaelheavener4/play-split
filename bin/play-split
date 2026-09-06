@@ -15,15 +15,101 @@ title="${2:-}"
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "usage: play-split [url] [title]" >&2
   echo "  Plays media in a tiled mpv pane next to your current windows." >&2
-  echo "  If no URL is given, uses the clipboard." >&2
+  echo "  If no URL is given: prompt (terminal) or clipboard (keybind)." >&2
+  echo "  Quote playlist URLs so bash does not treat & as background:" >&2
+  echo "    play-split 'https://www.youtube.com/watch?v=ID&list=...'" >&2
+  echo "  Over SSH the player still opens on this machine's desktop." >&2
   echo "  YouTube URLs close the original browser video and resume from" >&2
   echo "  the current playback position. Subtitles follow YouTube's CC" >&2
   echo "  on/off (c or the CC button still toggles them in mpv)." >&2
   exit 0
 fi
 
+# SSH and other non-desktop shells don't inherit the compositor. Pull it
+# from the systemd user session so mpv/hyprctl can talk to the logged-in
+# Hyprland session on this machine.
+attach_graphical_session() {
+  local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  export XDG_RUNTIME_DIR="$runtime"
+
+  if [[ -n "${WAYLAND_DISPLAY:-}" && -S "$runtime/$WAYLAND_DISPLAY" && -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    return 0
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    local line key
+    while IFS= read -r line; do
+      key="${line%%=*}"
+      case "$key" in
+        WAYLAND_DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|DISPLAY|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|XDG_SESSION_TYPE)
+          eval "export $line"
+          ;;
+      esac
+    done < <(systemctl --user show-environment 2>/dev/null || true)
+  fi
+
+  runtime="${XDG_RUNTIME_DIR:-$runtime}"
+  if [[ -z "${WAYLAND_DISPLAY:-}" || ! -S "$runtime/$WAYLAND_DISPLAY" ]]; then
+    local sock
+    for sock in "$runtime"/wayland-*; do
+      [[ -S "$sock" ]] || continue
+      export WAYLAND_DISPLAY="${sock##*/}"
+      break
+    done
+  fi
+
+  if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" && -d "$runtime/hypr" ]]; then
+    local dir
+    for dir in "$runtime"/hypr/*; do
+      [[ -d "$dir" ]] || continue
+      export HYPRLAND_INSTANCE_SIGNATURE="${dir##*/}"
+      break
+    done
+  fi
+
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "$runtime/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
+  fi
+
+  if [[ -z "${WAYLAND_DISPLAY:-}" || ! -S "$runtime/$WAYLAND_DISPLAY" ]]; then
+    echo "play-split: no graphical session on this machine (not logged into Hyprland)." >&2
+    echo "  The player opens on the Omarchy desktop you are logged into, not inside SSH." >&2
+    exit 1
+  fi
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+attach_graphical_session
+
+url="$(trim "$url")"
+title="$(trim "$title")"
+
 if [[ -z "$url" ]]; then
-  url="$(wl-paste --no-newline 2>/dev/null || true)"
+  if [[ -t 0 ]]; then
+    clip="$(trim "$(wl-paste --no-newline 2>/dev/null || true)")"
+    if [[ -n "$clip" ]]; then
+      echo "Clipboard: $clip" >&2
+      echo "Paste a media URL, or press Enter to use the clipboard:" >&2
+    else
+      echo "Paste a media URL, then press Enter:" >&2
+    fi
+    typed=""
+    IFS= read -r typed || true
+    typed="$(trim "$typed")"
+    if [[ -n "$typed" ]]; then
+      url="$typed"
+    else
+      url="$clip"
+    fi
+  else
+    url="$(trim "$(wl-paste --no-newline 2>/dev/null || true)")"
+  fi
 fi
 
 # Timestamp is read from this original string (watch URL, youtu.be, or embed).
@@ -346,7 +432,6 @@ args=(
   --keepaspect-window=no
   --osc=yes
   --osd-level=1
-  --no-terminal
   --log-file="$log_file"
   --scripts="$script_dir/cc-toggle.lua"
   --script-opts=osc-hidetimeout=2500
@@ -368,6 +453,24 @@ fi
 
 if [[ -n "$start_at" ]]; then
   args+=(--start="$start_at" --hr-seek=yes)
+fi
+
+if [[ -t 2 ]]; then
+  args+=(--msg-level=all=error)
+else
+  args+=(--no-terminal)
+fi
+
+echo "play-split: opening on the desktop: $url" >&2
+
+if [[ -t 2 ]]; then
+  code=0
+  mpv "${args[@]}" -- "$url" || code=$?
+  if [[ "$code" -ne 0 ]]; then
+    echo "play-split: mpv failed (exit $code). Last log lines:" >&2
+    tail -n 40 "$log_file" >&2 || true
+  fi
+  exit "$code"
 fi
 
 exec mpv "${args[@]}" -- "$url"
