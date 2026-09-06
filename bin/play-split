@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# Play a YouTube/media URL in tiled mpv (no browser chrome).
+# Usage: play-split [url] [title]
+# With no URL, uses the clipboard (raw URL or a YouTube iframe embed).
+# YouTube URLs close the original browser/webapp player so the new
+# tiled window replaces it instead of playing on top of it.
+# Resume: starts from the browser's current time (MPRIS) or a URL t=/start=.
+# Subs: load tracks the video provides, matching YouTube's current CC on/off.
+
+set -euo pipefail
+
+url="${1:-}"
+title="${2:-}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "usage: play-split [url] [title]" >&2
+  echo "  Plays media in a tiled mpv pane next to your current windows." >&2
+  echo "  If no URL is given, uses the clipboard." >&2
+  echo "  YouTube URLs close the original browser video and resume from" >&2
+  echo "  the current playback position. Subtitles follow YouTube's CC" >&2
+  echo "  on/off (c or the CC button still toggles them in mpv)." >&2
+  exit 0
+fi
+
+if [[ -z "$url" ]]; then
+  url="$(wl-paste --no-newline 2>/dev/null || true)"
+fi
+
+# Timestamp is read from this original string (watch URL, youtu.be, or embed).
+source_url="$url"
+
+if [[ "$url" == *"<iframe"* || "$url" == *"youtube.com/embed/"* || "$url" == *"youtube-nocookie.com/embed/"* ]]; then
+  embed="$(printf '%s' "$url" | grep -oE 'https://(www\.)?youtube(-nocookie)?\.com/embed/[A-Za-z0-9_-]+[^\"'\''[:space:]]*' | head -1 || true)"
+  if [[ -n "$embed" ]]; then
+    id="$(printf '%s' "$embed" | grep -oE '/embed/[A-Za-z0-9_-]+' | head -1)"
+    id="${id##*/embed/}"
+    url="https://www.youtube.com/watch?v=$id"
+    source_url="$embed"
+  fi
+fi
+
+if [[ -z "$url" ]]; then
+  echo "play-split: no URL given and clipboard is empty" >&2
+  exit 1
+fi
+
+is_youtube() {
+  local u="${1,,}"
+  [[ "$u" == *youtube.com* || "$u" == *youtu.be* || "$u" == *youtube-nocookie.com* ]]
+}
+
+# Seconds from t= / start= / #t= on the URL (YouTube "copy at current time").
+url_timestamp_seconds() {
+  python3 - "$1" <<'PY'
+import re, sys
+from urllib.parse import unquote, urlparse, parse_qs
+
+url = sys.argv[1]
+parsed = urlparse(url)
+qs = parse_qs(parsed.query)
+# Fragment can be t=1m30s or 1m30s
+frag = parsed.fragment or ""
+frag_qs = parse_qs(frag) if "=" in frag else {}
+
+def parse_stamp(value):
+    value = unquote(str(value or "")).strip()
+    if not value:
+        return None
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", value, re.I)
+    if m and any(m.groups()):
+        h, mi, s = m.groups()
+        return int(h or 0) * 3600 + int(mi or 0) * 60 + float(s or 0)
+    if re.fullmatch(r"\d+:\d{1,2}(:\d{1,2}(?:\.\d+)?)?", value):
+        parts = [float(p) for p in value.split(":")]
+        t = 0.0
+        for p in parts:
+            t = t * 60 + p
+        return t
+    try:
+        return float(value.rstrip("sS"))
+    except ValueError:
+        return None
+
+for key in ("t", "start", "time_continue"):
+    for candidate in qs.get(key, []) + frag_qs.get(key, []):
+        seconds = parse_stamp(candidate)
+        if seconds and seconds >= 2:
+            print(f"{seconds:.3f}")
+            raise SystemExit
+if frag and "t=" not in frag:
+    seconds = parse_stamp(frag)
+    if seconds and seconds >= 2:
+        print(f"{seconds:.3f}")
+PY
+}
+
+# Live position from Chromium/Firefox HTML5/YouTube via MPRIS (microseconds).
+browser_position_seconds() {
+  python3 - <<'PY'
+import re, subprocess
+
+try:
+    listing = subprocess.check_output(["busctl", "--user", "list", "--no-legend"], text=True)
+except Exception:
+    raise SystemExit(0)
+
+pat = re.compile(
+    r"^org\.mpris\.MediaPlayer2\.(chromium|chrome|google-chrome|firefox|brave|vivaldi|helium|microsoft-edge)"
+)
+best = None  # (priority, seconds)
+for line in listing.splitlines():
+    name = line.split()[0] if line.split() else ""
+    if not pat.match(name):
+        continue
+
+    def prop(key):
+        r = subprocess.run(
+            [
+                "busctl", "--user", "get-property", name,
+                "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", key,
+            ],
+            capture_output=True, text=True,
+        )
+        return (r.stdout or "").strip()
+
+    status_raw = prop("PlaybackStatus")
+    pos_raw = prop("Position")
+    status = status_raw.split('"', 1)[-1].rstrip('"') if '"' in status_raw else ""
+    nums = re.findall(r"-?\d+", pos_raw)
+    if not nums:
+        continue
+    seconds = int(nums[-1]) / 1_000_000
+    if seconds < 2:
+        continue
+    if status == "Playing":
+        prio = 2
+    elif status == "Paused":
+        prio = 1
+    else:
+        continue
+    if best is None or prio > best[0]:
+        best = (prio, seconds)
+
+if best:
+    print(f"{best[1]:.3f}")
+PY
+}
+
+resume_seconds() {
+  local from_browser from_url
+  from_browser="$(browser_position_seconds || true)"
+  from_url="$(url_timestamp_seconds "$1" || true)"
+  if [[ -n "$from_browser" ]]; then
+    printf '%s\n' "$from_browser"
+  elif [[ -n "$from_url" ]]; then
+    printf '%s\n' "$from_url"
+  fi
+}
+
+# Prints "on[<TAB>lang]", "off[<TAB>lang]", or "unknown".
+# Prefers the live YouTube CC button (captions.json from the companion
+# extension), then URL cc=/cc_load_policy=.
+caption_state() {
+  python3 - "$1" <<'PY'
+import json, re, sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+url = sys.argv[1]
+
+def video_id(u):
+    try:
+        p = urlparse(u)
+    except Exception:
+        return None
+    host = (p.hostname or "").lower()
+    if host.endswith("youtu.be"):
+        parts = [x for x in p.path.split("/") if x]
+        return parts[0] if parts else None
+    qs = parse_qs(p.query)
+    if qs.get("v"):
+        return qs["v"][0]
+    m = re.search(r"/(?:embed|shorts|live)/([^/?]+)", p.path or "")
+    return m.group(1) if m else None
+
+def url_cc(u):
+    p = urlparse(u)
+    qs = parse_qs(p.query)
+    frag_qs = parse_qs(p.fragment) if p.fragment else {}
+    for key in ("cc", "cc_load_policy"):
+        for val in qs.get(key, []) + frag_qs.get(key, []):
+            if str(val) in ("1", "true", "yes", "on"):
+                return True
+            if str(val) in ("0", "false", "no", "off"):
+                return False
+    return None
+
+wanted = video_id(url)
+state_path = Path.home() / ".local/state/play-split/captions.json"
+file_on = None
+file_lang = None
+file_match = False
+try:
+    data = json.loads(state_path.read_text())
+    file_vid = data.get("video_id") or video_id(data.get("url") or "")
+    # Only the same video: another tab's CC state must not leak.
+    if wanted and file_vid == wanted:
+        file_match = True
+    if file_match:
+        file_on = bool(data.get("on"))
+        file_lang = data.get("lang") or None
+except Exception:
+    pass
+
+url_flag = url_cc(url)
+if file_on is not None:
+    on = file_on
+elif url_flag is not None:
+    on = url_flag
+else:
+    print("unknown")
+    raise SystemExit
+
+lang = file_lang or ""
+if on:
+    print(f"on\t{lang}")
+else:
+    print(f"off\t{lang}")
+PY
+}
+
+close_windows() {
+  local addr
+  while read -r addr; do
+    [[ -n "$addr" ]] || continue
+    hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null 2>&1 || true
+  done
+}
+
+# Always replace an existing split player instead of stacking another one.
+close_existing_player() {
+  hyprctl clients -j 2>/dev/null | python3 -c '
+import json, sys
+try:
+    clients = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for c in clients:
+    cls = f"{c.get("class") or ""} {c.get("initialClass") or ""}".lower()
+    if "play-split" in cls:
+        addr = c.get("address") or ""
+        if addr:
+            print(addr)
+' | close_windows
+  local pid cmdline
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    if [[ "$cmdline" == *"--wayland-app-id=play-split"* ]]; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done < <(pgrep -x mpv || true)
+}
+
+pause_browser_media() {
+  local dest
+  while read -r dest; do
+    [[ -n "$dest" ]] || continue
+    busctl --user call "$dest" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Pause >/dev/null 2>&1 || true
+  done < <(busctl --user list --no-legend 2>/dev/null | awk '
+    $1 ~ /^org\.mpris\.MediaPlayer2\.(chromium|chrome|google-chrome|firefox|brave|vivaldi|helium|microsoft-edge)/ { print $1 }
+  ')
+}
+
+# Close the YouTube webapp / watch-page / picture-in-picture window that is
+# still playing the same video we are about to tile.
+close_original_youtube() {
+  pause_browser_media
+  hyprctl clients -j 2>/dev/null | python3 -c '
+import json, re, sys
+try:
+    clients = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+youtube_class = re.compile(r"youtube\.com|youtu\.be|youtube-nocookie", re.I)
+youtube_title = re.compile(r"(^youtube$| - youtube$)", re.I)
+pip_title = re.compile(r"^picture[- ]in[- ]picture$", re.I)
+for c in clients:
+    cls = f"{c.get("class") or ""} {c.get("initialClass") or ""}"
+    title = c.get("title") or ""
+    if youtube_class.search(cls) or youtube_title.search(title.strip()) or pip_title.search(title.strip()):
+        addr = c.get("address") or ""
+        if addr:
+            print(addr)
+' | close_windows
+}
+
+# Capture resume time and YouTube CC state before we pause/close the original.
+start_at=""
+cap_kind="unknown"
+cap_lang=""
+if is_youtube "$url"; then
+  start_at="$(resume_seconds "$source_url" || true)"
+  cap_raw="$(caption_state "$source_url" || true)"
+  cap_kind="${cap_raw%%$'\t'*}"
+  if [[ "$cap_raw" == *$'\t'* ]]; then
+    cap_lang="${cap_raw#*$'\t'}"
+  fi
+else
+  start_at="$(url_timestamp_seconds "$source_url" || true)"
+fi
+
+close_existing_player
+if is_youtube "$url"; then
+  close_original_youtube
+fi
+
+log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/play-split"
+mkdir -p "$log_dir"
+log_file="$log_dir/mpv.log"
+script_dir="${XDG_DATA_HOME:-$HOME/.local/share}/play-split/mpv/scripts"
+
+sub_lang_glob="en.*"
+slang="en,en-US,en-orig,eng"
+if [[ -n "$cap_lang" ]]; then
+  cap_primary="${cap_lang%%-*}"
+  cap_primary="${cap_primary,,}"
+  if [[ "$cap_primary" =~ ^[a-z]{2,3}$ ]]; then
+    sub_lang_glob="${cap_primary}.*"
+    slang="${cap_lang},${cap_primary},${cap_primary}-orig,en"
+  fi
+fi
+
+# Mirror YouTube CC when we know it. Unknown (extension not reporting yet)
+# keeps subs visible so tracks still show up; the CC button can hide them.
+sub_visibility="yes"
+if [[ "$cap_kind" == "off" ]]; then
+  sub_visibility="no"
+elif [[ "$cap_kind" == "on" ]]; then
+  sub_visibility="yes"
+fi
+
+args=(
+  --wayland-app-id=play-split
+  --force-window=immediate
+  --keepaspect-window=no
+  --osc=yes
+  --osd-level=1
+  --no-terminal
+  --log-file="$log_file"
+  --scripts="$script_dir/cc-toggle.lua"
+  --script-opts=osc-hidetimeout=2500
+  --input-ipc-server="${XDG_RUNTIME_DIR:-/tmp}/play-split.sock"
+  --ytdl-raw-options=js-runtimes=node
+  --ytdl-raw-options-append=write-subs=
+  --ytdl-raw-options-append=write-auto-subs=
+  --ytdl-raw-options-append="sub-langs=${sub_lang_glob}"
+  --ytdl-format=18/best[ext=mp4]/best
+  --slang="$slang"
+  --sub-auto=fuzzy
+  --sub-visibility="$sub_visibility"
+  --sid=auto
+)
+
+if [[ -n "$title" ]]; then
+  args+=(--force-media-title="$title")
+fi
+
+if [[ -n "$start_at" ]]; then
+  args+=(--start="$start_at" --hr-seek=yes)
+fi
+
+exec mpv "${args[@]}" -- "$url"

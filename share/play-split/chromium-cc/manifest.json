@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "play-split captions",
+  "version": "1.0",
+  "description": "Reports YouTube caption on/off state to play-split",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAju4zaCwprANlxy/30SGY6gDGETzePC7gadP2zJUKUxkpIqlXSNbG7MfY7GH2lzF65e6DuNlDVYpiQQESrrVSzjxP02kO9YTJUnTAdT8HLud+XIo/LT7WvjQhkJl33B29bRU7RPaKpRH3T2uUuT/WwCS+sTJs9I+o8ZAxNd4m675ZC1rsb4FIMlCOYPfhQxRdGOVLyICha0JfVz/mo+g/jHaU9deT5sPu8zhJSXQ5iAtqDU1NdGjAugdMONWSa4cmtw3F9xy6c12YnHKLQNISkvKP0oVnIV4ApJVpQdiIKtbGqmH7lN4W6brPPGvFRuBG2i2CUX5X+772DV1B/k4MoQIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://youtube.com/*",
+        "*://youtu.be/*",
+        "*://*.youtube-nocookie.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

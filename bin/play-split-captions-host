@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Native messaging host: store YouTube caption on/off for play-split."""
+import json
+import os
+import struct
+import sys
+from pathlib import Path
+
+
+def read_message():
+    header = sys.stdin.buffer.read(4)
+    if len(header) < 4:
+        return None
+    (length,) = struct.unpack("<I", header)
+    if length <= 0 or length > 1024 * 1024:
+        return None
+    raw = sys.stdin.buffer.read(length)
+    if len(raw) < length:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def write_message(obj):
+    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(raw)))
+    sys.stdout.buffer.write(raw)
+    sys.stdout.buffer.flush()
+
+
+def main():
+    msg = read_message()
+    if not isinstance(msg, dict):
+        write_message({"ok": False})
+        return 0
+
+    state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "play-split"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    dest = state_dir / "captions.json"
+    tmp = dest.with_suffix(".json.tmp")
+
+    payload = {
+        "on": bool(msg.get("on")),
+        "lang": msg.get("lang") or None,
+        "kind": msg.get("kind") or None,
+        "url": msg.get("url") or "",
+        "video_id": msg.get("video_id") or None,
+        "ts": float(msg.get("ts") or 0),
+    }
+    tmp.write_text(json.dumps(payload) + "\n")
+    tmp.replace(dest)
+    write_message({"ok": True})
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
