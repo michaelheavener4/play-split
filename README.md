@@ -1,7 +1,7 @@
 # play-split
 
 Play a YouTube (or other media) URL in a tiled [mpv](https://mpv.io) pane on
-Omarchy / Hyprland — no browser chrome.
+Omarchy / Hyprland, with no browser chrome.
 
 `SUPER + SHIFT + M` grabs the clipboard URL (or a YouTube iframe embed),
 closes the original YouTube window, and resumes from the current time with
@@ -35,7 +35,7 @@ play-split --help
 
 Or press **SUPER + SHIFT + M**.
 
-Quote YouTube playlist URLs — bash treats `&` as background:
+Quote YouTube playlist URLs because bash treats `&` as background:
 
 ```bash
 play-split 'https://www.youtube.com/watch?v=ID&list=...'
